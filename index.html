@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sphere VJ</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000000; overflow: hidden; }
+  canvas { display: block; }
+  body.drag { outline: 3px dashed rgba(255,255,255,.6); outline-offset: -14px; }
+  #hint { position: fixed; left: 12px; bottom: 10px; font: 12px/1 system-ui, sans-serif;
+          color: rgba(255,255,255,.4); pointer-events: none; transition: opacity 1.5s; }
+</style>
+</head>
+<body>
+<div id="hint">H: hide / show controls &nbsp; R: reflections &nbsp; F: fullscreen &nbsp; Drop images anywhere to add textures</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+<script>
+/* ==========================================================================
+   CONFIG — single reactive source of truth. GUI writes here; loop reads here.
+   ========================================================================== */
+const CONFIG = {
+  count: 30,            // number of spheres (1..100)
+  size: 1.0,            // global sphere size multiplier
+  uniformSize: true,    // true = every sphere has the same size; false = random sizes
+  speed: 1.0,           // global time/movement multiplier
+  rotation: 1.0,        // global rotation multiplier
+  gravity: 14,          // downward acceleration (0 = floating)
+  bounciness: 0.9,      // restitution on the floor (1 = perfectly elastic)
+  squash: 1.0,          // squash & stretch amount on impact
+  inset: 0.0,           // 0 = side/top walls just offscreen, 1 = walls at screen edge
+  visibleFloor: true,   // floor sits at the bottom edge of the screen
+  keepAlive: true,      // re-launch spheres that come to rest so the show never dies
+  collisions: false,    // sphere-to-sphere collisions
+  customOnly: false,    // true = use only your loaded custom textures (procedural is used if none are loaded)
+  reflection: true,     // specular light reflection on/off
+  autoSave: true,       // save settings automatically whenever they change
+  minRadius: 0.8,
+  maxRadius: 6.0,
+  textureSize: 766,
+  // Optional preloaded images (URLs or base64 data URIs). Treated as custom textures.
+  externalTextures: [
+    // 'textures/one.png',
+    // 'data:image/png;base64,....'
+  ]
+};
+
+const WORLD = { camZ: 45, zMin: -60, zMax: 12, margin: 0.5, fov: 60 };
+
+/* ==========================================================================
+   Saved settings (localStorage). Textures are not saved, only parameters.
+   ========================================================================== */
+const SAVE_KEY = 'sphereVJ.settings.v1';
+const SAVED_KEYS = ['count', 'size', 'uniformSize', 'speed', 'rotation', 'reflection', 'gravity', 'bounciness', 'squash',
+                    'inset', 'visibleFloor', 'keepAlive', 'collisions', 'customOnly', 'autoSave'];
+const DEFAULTS = Object.fromEntries(SAVED_KEYS.map(k => [k, CONFIG[k]]));
+const snapshot = () => JSON.stringify(Object.fromEntries(SAVED_KEYS.map(k => [k, CONFIG[k]])));
+function applySettings(obj) {
+  SAVED_KEYS.forEach(k => { if (obj && typeof obj[k] === typeof CONFIG[k]) CONFIG[k] = obj[k]; });
+}
+function saveSettings() { try { localStorage.setItem(SAVE_KEY, snapshot()); return true; } catch (e) { return false; } }
+try { const raw = localStorage.getItem(SAVE_KEY); if (raw) applySettings(JSON.parse(raw)); } catch (e) {}
+
+/* ==========================================================================
+   AUDIO HOOK — fill these 0..1 values each frame from an AnalyserNode later.
+   ========================================================================== */
+const AUDIO = { bass: 0, mid: 0, treble: 0, beatTrigger: false };
+
+/* ==========================================================================
+   Renderer / scene / camera / lights
+   ========================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.setClearColor(0x000000, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+const camera = new THREE.PerspectiveCamera(WORLD.fov, 1, 0.1, 300);
+camera.position.set(0, 0, WORLD.camZ);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
+keyLight.position.set(-30, 40, 50);
+scene.add(keyLight);
+const fillLight = new THREE.PointLight(0x88aaff, 0.9, 0, 2);
+fillLight.position.set(30, -20, 30);
+scene.add(fillLight);
+
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight, aspect = w / h;
+  renderer.setSize(w, h);
+  camera.aspect = aspect;
+  const base = THREE.MathUtils.degToRad(WORLD.fov);
+  camera.fov = aspect >= 1 ? WORLD.fov
+    : THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(base / 2) / aspect)); // keep width coverage in portrait
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+onResize();
+
+/* ==========================================================================
+   Texture pipeline: procedural patterns + custom images (drop / button / config)
+   ========================================================================== */
+const TEX = CONFIG.textureSize;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const hsl = (h, s = 90, l = 55) => `hsl(${h % 360},${s}%,${l}%)`;
+function makeCanvas() { const c = document.createElement('canvas'); c.width = c.height = TEX; return [c, c.getContext('2d')]; }
+
+const PATTERNS = [
+  function checker() {
+    const [c, g] = makeCanvas(), n = 8, s = TEX / n, h = rnd(0, 360);
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+      g.fillStyle = (x + y) % 2 ? hsl(h, 95, 55) : hsl(h + 160, 95, 12);
+      g.fillRect(x * s, y * s, s + 1, s + 1);
+    }
+    return c;
+  },
+  function rings() {
+    const [c, g] = makeCanvas(), h = rnd(0, 360);
+    for (let i = 24; i > 0; i--) {
+      g.fillStyle = i % 2 ? hsl(h + i * 9) : hsl(h + 180, 90, 10);
+      g.beginPath(); g.arc(TEX / 2, TEX / 2, (i / 24) * TEX * 0.72, 0, Math.PI * 2); g.fill();
+    }
+    return c;
+  },
+  function stripes() {
+    const [c, g] = makeCanvas(), h = rnd(0, 360), w = TEX / 14;
+    g.fillStyle = '#050505'; g.fillRect(0, 0, TEX, TEX);
+    g.save(); g.translate(TEX / 2, TEX / 2); g.rotate(rnd(0, Math.PI));
+    for (let i = -14; i < 14; i++) { g.fillStyle = hsl(h + i * 14); g.fillRect(-TEX, i * w, TEX * 2, w * 0.6); }
+    g.restore();
+    return c;
+  },
+  function dots() {
+    const [c, g] = makeCanvas(), n = 9, s = TEX / n, h = rnd(0, 360);
+    g.fillStyle = hsl(h + 200, 80, 8); g.fillRect(0, 0, TEX, TEX);
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+      g.fillStyle = hsl(h + (x + y) * 20, 95, 60);
+      g.beginPath(); g.arc((x + 0.5) * s, (y + 0.5) * s, s * (0.2 + 0.25 * ((x * y) % 3) / 2), 0, 7); g.fill();
+    }
+    return c;
+  },
+  function plasma() {
+    const R = 192, small = document.createElement('canvas'); small.width = small.height = R;
+    const sg = small.getContext('2d'), img = sg.createImageData(R, R);
+    const a = rnd(3, 8), b = rnd(3, 8), p = rnd(0, 6.28), h = rnd(0, 360), col = new THREE.Color();
+    for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+      const u = x / R, v = y / R;
+      const t = Math.sin(u * a * 6.28 + p) + Math.sin(v * b * 6.28) + Math.sin((u + v) * 6.28 * 3);
+      col.setHSL(((h / 360) + t * 0.12 + 1) % 1, 0.9, 0.35 + 0.15 * Math.sin(t * 2));
+      const i = (y * R + x) * 4;
+      img.data[i] = col.r * 255; img.data[i + 1] = col.g * 255; img.data[i + 2] = col.b * 255; img.data[i + 3] = 255;
+    }
+    sg.putImageData(img, 0, 0);
+    const [c, g] = makeCanvas(); g.drawImage(small, 0, 0, TEX, TEX);
+    return c;
+  },
+  function spiral() {
+    const [c, g] = makeCanvas(), arms = 12, h = rnd(0, 360), tw = rnd(4, 10), R = TEX * 0.75;
+    g.translate(TEX / 2, TEX / 2);
+    for (let i = 0; i < arms * 2; i++) {
+      const a0 = (i / (arms * 2)) * 6.2832, a1 = ((i + 1) / (arms * 2)) * 6.2832;
+      g.fillStyle = i % 2 ? hsl(h + i * 8) : hsl(h + 180, 90, 12);
+      g.beginPath(); g.moveTo(0, 0);
+      for (let r = 0; r <= R; r += 10) g.lineTo(Math.cos(a0 + r * tw / TEX) * r, Math.sin(a0 + r * tw / TEX) * r);
+      for (let r = R; r >= 0; r -= 10) g.lineTo(Math.cos(a1 + r * tw / TEX) * r, Math.sin(a1 + r * tw / TEX) * r);
+      g.fill();
+    }
+    return c;
+  }
+];
+
+const procPool = [], customPool = [];
+function addTexture(canvas, custom) {
+  const t = new THREE.CanvasTexture(canvas);
+  t.encoding = THREE.sRGBEncoding;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  // UV mapping: U repeats 2x around the equator, so one full copy of the texture covers each
+  // 180 degree hemisphere (front and back). V stays 1x pole-to-pole.
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(2, 1);
+  (custom ? customPool : procPool).push(t);
+  return t;
+}
+PATTERNS.forEach(fn => { addTexture(fn()); addTexture(fn()); });
+
+function activePool() {
+  if (CONFIG.customOnly && customPool.length) return customPool;
+  return procPool.concat(customPool);
+}
+function randomTexture(exclude) {
+  const pool = activePool();
+  let t, tries = 0;
+  do { t = pool[(Math.random() * pool.length) | 0]; } while (t === exclude && pool.length > 1 && ++tries < 6);
+  return t;
+}
+const setMap = (m, t) => { m.userData.mat.map = t; };
+
+/* Any image (File, URL, data URI) -> centre-cropped 766x766 square -> texture pool */
+const info = { custom: '0 loaded' };
+const updateInfo = () => { info.custom = customPool.length + ' loaded'; };
+let loadGen = 0; // bumped on every new load / clear, so late arrivals from an older batch are ignored
+
+function refreshSpheres(all) { // all = reshuffle every sphere; otherwise only fix ones using unavailable textures
+  const pool = activePool();
+  spheres.forEach(m => { if (all || !pool.includes(m.userData.mat.map)) setMap(m, randomTexture()); });
+}
+
+/* Draw any decoded image (HTMLImageElement or ImageBitmap) into the custom pool */
+function commitImage(img, gen = loadGen) {
+  if (gen !== loadGen) { if (img.close) img.close(); return; }
+  const [c, g] = makeCanvas(), s = Math.min(img.width, img.height);
+  g.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, TEX, TEX);
+  if (img.close) img.close();
+  const t = addTexture(c, true);
+  if (CONFIG.customOnly) refreshSpheres(true);
+  else if (spheres.length) setMap(spheres[(Math.random() * spheres.length) | 0], t); // instant feedback
+  updateInfo();
+}
+/* URL / data-URI path. crossOrigin only for real http(s) URLs. */
+function ingestImage(src, gen = loadGen) {
+  const img = new Image();
+  if (/^https?:/i.test(src)) img.crossOrigin = 'anonymous';
+  img.onload = () => commitImage(img, gen);
+  img.onerror = () => console.warn('Texture failed to load:', String(src).slice(0, 80));
+  img.src = src;
+}
+/* File path: no blob URLs, which sandboxed previews can block. */
+function addFile(f, gen) {
+  const viaReader = () => {
+    const fr = new FileReader();
+    fr.onload = () => ingestImage(fr.result, gen);
+    fr.onerror = () => console.warn('Could not read file:', f.name);
+    fr.readAsDataURL(f);
+  };
+  if (window.createImageBitmap) createImageBitmap(f).then(bmp => commitImage(bmp, gen)).catch(viaReader);
+  else viaReader();
+}
+
+function clearCustom() {
+  loadGen++;                                   // cancels any loads still in flight
+  customPool.forEach(t => t.dispose());
+  customPool.length = 0;
+  refreshSpheres(false);                       // spheres holding a removed texture get a new one
+  updateInfo();
+}
+/* Every load REPLACES the custom library: only the most recent selection/drop counts. */
+function loadFiles(list) {
+  const files = [...list].filter(f => f.type.startsWith('image/'));
+  if (!files.length) return;
+  clearCustom();
+  files.forEach(f => addFile(f, loadGen));
+}
+
+/* Drag & drop + file picker */
+const body = document.body;
+['dragenter', 'dragover'].forEach(ev => window.addEventListener(ev, e => { e.preventDefault(); body.classList.add('drag'); }));
+window.addEventListener('dragleave', e => { if (!e.relatedTarget) body.classList.remove('drag'); });
+window.addEventListener('drop', e => { e.preventDefault(); body.classList.remove('drag'); loadFiles(e.dataTransfer.files); });
+const fileInput = document.createElement('input');
+Object.assign(fileInput, { type: 'file', multiple: true, accept: 'image/*' });
+fileInput.style.display = 'none';
+fileInput.addEventListener('change', () => { loadFiles(fileInput.files); fileInput.value = ''; });
+document.body.appendChild(fileInput);
+
+/* ==========================================================================
+   Spheres — each is a Group (world-axis squash/stretch) holding a rotating Mesh
+   ========================================================================== */
+const geometry = new THREE.SphereGeometry(1, 48, 32);
+const spheres = [];
+
+function extent(z) {
+  const hy = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * (WORLD.camZ - z);
+  return { x: hy * camera.aspect, y: hy };
+}
+// Wall limit for a sphere centre: inset 0 = fully offscreen, 1 = touching screen edge
+const limit = (half, r) => Math.max(0.1, THREE.MathUtils.lerp(half + r + WORLD.margin, half - r, CONFIG.inset));
+
+function createSphere() {
+  const base = CONFIG.minRadius + Math.pow(Math.random(), 1.8) * (CONFIG.maxRadius - CONFIG.minRadius);
+  const mat = new THREE.MeshPhongMaterial({ map: randomTexture(), shininess: 70, specular: CONFIG.reflection ? 0x444444 : 0x000000 });
+  const mesh = new THREE.Mesh(geometry, mat);
+  mesh.scale.setScalar(base * CONFIG.size);
+  mesh.rotation.set(rnd(0, 6.28), rnd(0, 6.28), rnd(0, 6.28));
+  const group = new THREE.Group();
+  group.add(mesh);
+
+  const z = rnd(WORLD.zMin, WORLD.zMax), b = extent(z);
+  group.position.set(rnd(-b.x, b.x) * 0.9, rnd(-b.y, b.y) * 0.9, z);
+  group.userData = {
+    mesh, mat, radius: base, r: base * CONFIG.size,
+    vel: new THREE.Vector3(rnd(-1, 1), rnd(-0.5, 1), rnd(-0.35, 0.35)).normalize().multiplyScalar(rnd(4, 10)),
+    spin: new THREE.Vector3(rnd(-0.5, 0.5), rnd(-0.5, 0.5), rnd(-0.3, 0.3)),
+    def: new THREE.Vector3(), dv: new THREE.Vector3(),   // squash spring state (per world axis)
+    offscreen: false
+  };
+  scene.add(group);
+  spheres.push(group);
+}
+function removeSphere() {
+  const m = spheres.pop();
+  if (!m) return;
+  scene.remove(m);
+  m.userData.mat.dispose(); // textures are pooled, not disposed here
+}
+function syncCount() {
+  const n = Math.round(CONFIG.count);
+  while (spheres.length < n) createSphere();
+  while (spheres.length > n) removeSphere();
+}
+
+/* ==========================================================================
+   Update loop
+   ========================================================================== */
+const UNIFORM_R = (CONFIG.minRadius + CONFIG.maxRadius) / 2;
+const clock = new THREE.Clock();
+const frustum = new THREE.Frustum(), projView = new THREE.Matrix4(), tmpSphere = new THREE.Sphere();
+const SPRING_K = 170, SPRING_C = 9, AXES = ['x', 'y', 'z'];
+const clamp = THREE.MathUtils.clamp;
+const hit = (d, axis, speed) => { d.dv[axis] -= speed * CONFIG.squash * 0.05; }; // compress along impact axis
+
+function updatePhysics(dt) {
+  // --- AUDIO HOOKS: bass -> speed, treble -> rotation, mid -> size pulse, bass -> bounce energy
+  const speedMul = CONFIG.speed * (1 + AUDIO.bass * 1.5), sdt = dt * speedMul;
+  const rotMul = CONFIG.rotation * (1 + AUDIO.treble * 3);
+  const pulse = CONFIG.size * (1 + AUDIO.mid * 0.25);
+  const e = CONFIG.bounciness * (1 + AUDIO.bass * 0.3);   // >1 adds energy on each floor hit
+
+  for (const m of spheres) {
+    const d = m.userData, v = d.vel, r = (d.r = (CONFIG.uniformSize ? UNIFORM_R : d.radius) * pulse);
+
+    // --- AUDIO HOOK: beat -> random kick with an upward bias
+    if (AUDIO.beatTrigger) { v.x += rnd(-6, 6); v.y += rnd(4, 12); v.z += rnd(-2, 2); }
+
+    v.y -= CONFIG.gravity * sdt;
+    m.position.addScaledVector(v, sdt);
+    d.mesh.rotation.x += d.spin.x * dt * rotMul;
+    d.mesh.rotation.y += d.spin.y * dt * rotMul;
+    d.mesh.rotation.z += d.spin.z * dt * rotMul;
+    d.mesh.scale.setScalar(r);
+
+    const b = extent(m.position.z);
+    const lx = limit(b.x, r), ly = limit(b.y, r);
+    const fy = CONFIG.visibleFloor ? Math.max(0.1, b.y - r) : ly;
+    const p = m.position;
+
+    if (p.x >  lx) { p.x =  lx; if (v.x > 0) { hit(d, 'x',  v.x); v.x = -v.x; } }
+    if (p.x < -lx) { p.x = -lx; if (v.x < 0) { hit(d, 'x', -v.x); v.x = -v.x; } }
+    if (p.y >  ly) { p.y =  ly; if (v.y > 0) { hit(d, 'y',  v.y); v.y = -v.y; } }
+    if (p.y < -fy) {
+      p.y = -fy;
+      if (v.y < 0) {
+        hit(d, 'y', -v.y);
+        v.y = -v.y * e;
+        if (CONFIG.keepAlive && CONFIG.gravity > 0 && v.y < 3) v.y = rnd(18, 30); // relaunch when resting
+      }
+    }
+    const zMax = WORLD.zMax - r * 0.5;
+    if (p.z > zMax)       { p.z = zMax;       v.z = -Math.abs(v.z); }
+    if (p.z < WORLD.zMin) { p.z = WORLD.zMin; v.z =  Math.abs(v.z); }
+    if (v.length() > 40) v.multiplyScalar(0.98);
+
+    // Squash & stretch spring (world-axis aligned, volume-ish preserving)
+    for (const a of AXES) {
+      d.dv[a] += (-SPRING_K * d.def[a] - SPRING_C * d.dv[a]) * dt;
+      d.def[a] = clamp(d.def[a] + d.dv[a] * dt, -0.45, 0.45);
+    }
+    m.scale.set(
+      clamp(1 + d.def.x - 0.5 * (d.def.y + d.def.z), 0.5, 1.5),
+      clamp(1 + d.def.y - 0.5 * (d.def.x + d.def.z), 0.5, 1.5),
+      clamp(1 + d.def.z - 0.5 * (d.def.x + d.def.y), 0.5, 1.5));
+  }
+  AUDIO.beatTrigger = false;
+  if (CONFIG.collisions) collide();
+}
+
+const nrm = new THREE.Vector3();
+function collide() {
+  for (let i = 0; i < spheres.length; i++) for (let j = i + 1; j < spheres.length; j++) {
+    const A = spheres[i], B = spheres[j], a = A.userData, b = B.userData;
+    nrm.subVectors(B.position, A.position);
+    const dist = nrm.length(), min = a.r + b.r;
+    if (dist >= min || dist === 0) continue;
+    nrm.divideScalar(dist);
+    const ma = a.r ** 3, mb = b.r ** 3, push = (min - dist) / (ma + mb);
+    A.position.addScaledVector(nrm, -push * mb);
+    B.position.addScaledVector(nrm,  push * ma);
+    const rv = nrm.dot(a.vel) - nrm.dot(b.vel);
+    if (rv <= 0) continue;
+    const j2 = (1 + 0.95) * rv / (1 / ma + 1 / mb);
+    a.vel.addScaledVector(nrm, -j2 / ma);
+    b.vel.addScaledVector(nrm,  j2 / mb);
+    const s = Math.abs(rv);
+    a.dv.addScaledVector(nrm, -s * CONFIG.squash * 0.03);
+    b.dv.addScaledVector(nrm, -s * CONFIG.squash * 0.03);
+  }
+}
+
+function checkVisibility() {
+  camera.updateMatrixWorld();
+  projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projView);
+  for (const m of spheres) {
+    const d = m.userData;
+    tmpSphere.set(m.position, d.r * 1.5); // generous: squash can enlarge the silhouette
+    const visible = frustum.intersectsSphere(tmpSphere);
+    if (!visible && !d.offscreen) { d.offscreen = true; setMap(m, randomTexture(d.mat.map)); } // swap while unseen
+    else if (visible) d.offscreen = false;
+  }
+}
+
+function render() { renderer.render(scene, camera); }
+
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  updatePhysics(dt);
+  checkVisibility();
+  render();
+}
+
+/* ==========================================================================
+   GUI + hotkeys
+   ========================================================================== */
+function applyReflection() {
+  spheres.forEach(m => m.userData.mat.specular.setHex(CONFIG.reflection ? 0x444444 : 0x000000));
+}
+const gui = new dat.GUI({ width: 290 });
+const fScene = gui.addFolder('Scene');
+fScene.add(CONFIG, 'count', 1, 100, 1).name('Sphere count').onChange(syncCount);
+fScene.add(CONFIG, 'size', 0.2, 3, 0.01).name('Sphere size');
+fScene.add(CONFIG, 'uniformSize').name('All same size');
+fScene.add(CONFIG, 'speed', 0, 10, 0.01).name('Movement speed');
+fScene.add(CONFIG, 'rotation', 0, 10, 0.01).name('Rotation speed');
+const reflCtl = fScene.add(CONFIG, 'reflection').name('Light reflection').onChange(applyReflection);
+fScene.open();
+const fBounce = gui.addFolder('Bounce');
+fBounce.add(CONFIG, 'gravity', 0, 60, 0.5).name('Gravity');
+fBounce.add(CONFIG, 'bounciness', 0, 1.1, 0.01).name('Bounciness');
+fBounce.add(CONFIG, 'squash', 0, 3, 0.01).name('Squash & stretch');
+fBounce.add(CONFIG, 'inset', 0, 1, 0.01).name('Wall inset');
+fBounce.add(CONFIG, 'visibleFloor').name('Visible floor');
+fBounce.add(CONFIG, 'keepAlive').name('Keep alive');
+fBounce.add(CONFIG, 'collisions').name('Sphere collisions');
+fBounce.open();
+const fTex = gui.addFolder('Textures');
+fTex.add(CONFIG, 'customOnly').name('Custom textures only').onChange(() => refreshSpheres(true));
+const infoCtl = fTex.add(info, 'custom').name('Custom').listen();
+infoCtl.domElement.querySelector('input').readOnly = true;
+fTex.add({ load: () => fileInput.click() }, 'load').name('Load images...');
+fTex.add({ clear: clearCustom }, 'clear').name('Clear custom');
+fTex.open();
+
+/* Settings folder: save / reset / copy / paste */
+const saveInfo = { status: 'Auto-save on' };
+const fSave = gui.addFolder('Settings');
+function refreshGUI() {
+  (function walk(g) { g.__controllers.forEach(c => c.updateDisplay()); Object.values(g.__folders).forEach(walk); })(gui);
+}
+function applyAll(obj) {   // push loaded values into the running scene
+  applySettings(obj);
+  syncCount(); applyReflection(); refreshSpheres(true); refreshGUI();
+}
+let lastSaved = snapshot();
+const setStatus = (t) => { saveInfo.status = t; };
+function saveNow() { lastSaved = snapshot(); setStatus(saveSettings() ? 'Saved' : 'Storage unavailable: use Copy'); }
+const stCtl = fSave.add(saveInfo, 'status').name('Status').listen();
+stCtl.domElement.querySelector('input').readOnly = true;
+fSave.add(CONFIG, 'autoSave').name('Auto-save').onChange(v => { if (v) saveNow(); else setStatus('Auto-save off'); });
+fSave.add({ save: saveNow }, 'save').name('Save now');
+fSave.add({ reset: () => { applyAll(DEFAULTS); setStatus('Reset to defaults'); } }, 'reset').name('Reset to defaults');
+fSave.add({ copy: () => {
+  const json = snapshot();
+  (navigator.clipboard ? navigator.clipboard.writeText(json) : Promise.reject())
+    .then(() => setStatus('Copied to clipboard'))
+    .catch(() => { prompt('Copy your settings:', json); });
+} }, 'copy').name('Copy settings');
+fSave.add({ paste: () => {
+  const t = prompt('Paste settings JSON:');
+  if (!t) return;
+  try { applyAll(JSON.parse(t)); setStatus('Settings loaded'); } catch (e) { setStatus('Invalid settings text'); }
+} }, 'paste').name('Paste settings');
+fSave.open();
+setInterval(() => {   // debounced auto-save: only writes when something actually changed
+  if (!CONFIG.autoSave) return;
+  const now = snapshot();
+  if (now !== lastSaved) saveNow();
+}, 1000);
+
+let uiVisible = true;
+function toggleUI() {
+  uiVisible = !uiVisible;
+  gui.domElement.style.display = uiVisible ? '' : 'none';
+  document.getElementById('hint').style.opacity = uiVisible ? 1 : 0;
+  document.body.style.cursor = uiVisible ? '' : 'none';
+}
+window.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (k === 'h') toggleUI();
+  if (k === 'r') { CONFIG.reflection = !CONFIG.reflection; applyReflection(); reflCtl.updateDisplay(); }
+  if (k === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+setTimeout(() => { if (uiVisible) document.getElementById('hint').style.opacity = 0.2; }, 7000);
+
+/* ==========================================================================
+   Go
+   ========================================================================== */
+CONFIG.externalTextures.forEach(u => ingestImage(u));
+syncCount();
+tick();
+
+/* Audio hookup example (Web Audio), later:
+   const an = audioCtx.createAnalyser(); an.fftSize = 512;
+   const bins = new Uint8Array(an.frequencyBinCount);
+   // each frame, before updatePhysics():
+   an.getByteFrequencyData(bins);
+   AUDIO.bass = avg(bins, 0, 8) / 255;  AUDIO.mid = avg(bins, 8, 60) / 255;  AUDIO.treble = avg(bins, 60, 200) / 255;
+   AUDIO.beatTrigger = AUDIO.bass > threshold && !wasBeat;                                              */
+</script>
+</body>
+</html>
